@@ -1,196 +1,168 @@
-(function safeAutoCollect() {
-    // ===== Trạng thái toàn cục cho lịch collect =====
-    const AutoCollectState = {
-        runningTimeoutId: null,
-        lastInterval: 15000,
+(function autoCollector() {
+    const state = {
+        timeoutId: null,
+        watcherId: null,
         stopped: false,
-        lastDisplay: undefined
+        lastDisplay: null
     };
 
-    // ===== Cookie utils =====
-    function setCookie(name, value, days=1) {
-        let expires = "";
-        if (days) {
-            let date = new Date();
-            date.setTime(date.getTime() + (days*24*60*60*1000));
-            expires = "; expires=" + date.toUTCString();
+    // ===== Cookie tiện ích =====
+    const Cookie = {
+        set(name, value, days = 1) {
+            const expires = new Date(Date.now() + days * 86400000).toUTCString();
+            document.cookie = `${name}=${value}; expires=${expires}; path=/`;
+        },
+        get(name) {
+            const prefix = name + "=";
+            return document.cookie.split(";").map(s => s.trim())
+                .find(c => c.startsWith(prefix))?.substring(prefix.length) || null;
         }
-        document.cookie = name + "=" + (value || "") + expires + "; path=/";
-    }
-    function getCookie(name) {
-        let nameEQ = name + "=";
-        let ca = document.cookie.split(";").map(s => s.trim());
-        for (let c of ca) if (c.indexOf(nameEQ) === 0) return c.substring(nameEQ.length);
-        return null;
-    }
+    };
 
-    // ===== Tính interval động dựa trên cookie =====
-    function getNextInterval() {
-        let last = getCookie("lastCollectTime");
-        if (last) {
-            let lastTime = parseInt(last, 10);
-            let diff = Date.now() - lastTime; // ms
-            let minGap = 30000; // tối thiểu 30s
-            if (diff < minGap) return minGap - diff;
-        }
-        return 15000; // mặc định 15s
-    }
-
-    // ===== Dừng lịch collect an toàn =====
-    function stopAutoCollect(reason = "unknown") {
-        if (AutoCollectState.stopped) return;
-        AutoCollectState.stopped = true;
-        if (AutoCollectState.runningTimeoutId) {
-            clearTimeout(AutoCollectState.runningTimeoutId);
-            AutoCollectState.runningTimeoutId = null;
-        }
-        console.log("[AutoCollect] Dừng lại. Lý do:", reason);
-    }
-
-    // ===== Watcher theo dõi app.reader.display =====
-    function startDisplayWatcher() {
-        // Khởi tạo giá trị ban đầu
-        AutoCollectState.lastDisplay = app.reader.display;
-        console.log("[AutoCollect] Watcher display bắt đầu, giá trị đầu:", AutoCollectState.lastDisplay);
-
-        const watchId = setInterval(() => {
-            // Nếu chưa sẵn sàng hoặc đã dừng, kết thúc watcher
-            if (!window.app || !app.reader || AutoCollectState.stopped) {
-                clearInterval(watchId);
-                return;
-            }
-
-            const currentDisplay = app.reader.display;
-
-            // Nếu display chuyển về null (hoặc undefined), dừng auto-collect
-            if (currentDisplay == null) {
-                stopAutoCollect("display trở thành null/undefined");
-                clearInterval(watchId);
-                return;
-            }
-
-            // Nếu có thay đổi (ví dụ view đổi sang component khác), bạn có thể reset logic tùy ý
-            if (currentDisplay !== AutoCollectState.lastDisplay) {
-                console.log("[AutoCollect] display thay đổi:", currentDisplay);
-                AutoCollectState.lastDisplay = currentDisplay;
-                // Optional: có thể dừng hoặc tiếp tục, tuỳ ý
-                // stopAutoCollect("display thay đổi sang trạng thái mới");
-            }
-        }, 1000); // kiểm tra mỗi 1s
-    }
-
-    // ===== Polling khởi động =====
-    if (!window.app || !app.reader || typeof app.reader.getPCN !== "function" || !app.net) {
-        console.log("App chưa sẵn sàng, thử lại sau 1s...");
-        setTimeout(safeAutoCollect, 1000);
-        return;
-    }
-
-    if (!document.cookie.includes("access=")) {
-        console.log("Chưa đăng nhập, thử lại sau 1s...");
-        setTimeout(safeAutoCollect, 1000);
-        return;
-    }
-
-    // ===== Định nghĩa collect nếu chưa có =====
-    app.net.collect = app.net.collect || (async function() {
+    // ===== Lấy level người dùng =====
+    function getUserLevel() {
+        // Có thể tuỳ chỉnh nếu app lưu ở chỗ khác
         try {
-            // Nếu đã dừng, không làm gì nữa
-            if (AutoCollectState.stopped) return;
+            return parseInt(app?.user?.profile?.level || 1);
+        } catch {
+            return 1;
+        }
+    }
 
-            // 1) Check nhặt bảo
-            let res1 = await fetch("/index.php?ngmar=iscollectable", {
+    // ===== Xác định interval theo level =====
+    function getIntervalByLevel() {
+        const level = getUserLevel();
+        switch (level) {
+            case 1: return 2 * 60 * 1000;  // 2 phút
+            case 2: return 5 * 60 * 1000;  // 5 phút
+            case 3: return 7 * 60 * 1000;  // 7 phút
+            default: return 12 * 60 * 1000; // tối đa 12 phút
+        }
+    }
+
+    // ===== Stop / Restart =====
+    function stop(reason = "unknown") {
+        if (state.stopped) return;
+        state.stopped = true;
+        if (state.timeoutId) {
+            clearTimeout(state.timeoutId);
+            state.timeoutId = null;
+        }
+        console.log("[AutoCollect] Dừng lại:", reason);
+    }
+
+    function restart() {
+        if (!state.stopped) return;
+        console.log("[AutoCollect] Restart do display có giá trị trở lại");
+        state.stopped = false;
+        scheduleNext();
+    }
+
+    // ===== Watcher display =====
+    function startDisplayWatcher() {
+        if (state.watcherId) clearInterval(state.watcherId);
+        if (!app?.reader) return console.warn("[AutoCollect] app.reader chưa sẵn sàng");
+
+        state.lastDisplay = app.reader.display;
+        console.log("[AutoCollect] Watcher khởi động, display =", state.lastDisplay);
+
+        state.watcherId = setInterval(() => {
+            const display = app.reader.display;
+            if (display == null && state.lastDisplay != null) stop("display null");
+            if (display != null && state.lastDisplay == null) restart();
+            state.lastDisplay = display;
+        }, 1000);
+    }
+
+    // ===== Thực hiện collect =====
+    async function collect() {
+        if (state.stopped) return;
+
+        try {
+            console.log("[AutoCollect] Kiểm tra nhặt...");
+            const check = await fetch("/index.php?ngmar=iscollectable", {
                 method: "POST",
-                headers: {"Content-Type":"application/x-www-form-urlencoded"},
+                headers: { "Content-Type": "application/x-www-form-urlencoded" },
                 body: "ngmar=tcollect&sajax=trycollect",
                 credentials: "include"
-            });
-            let json1 = await res1.json();
-            console.log("Check collectable:", json1);
-            if (json1.code != 1) {
-                console.log("Không có gì để nhặt.");
+            }).then(r => r.json());
+
+            if (check.code !== 1) {
+                console.log("[AutoCollect] Không có gì để nhặt.");
                 return;
             }
 
-            // 2) Collect
-            let res2 = await fetch("/index.php?ngmar=collect", {
+            console.log("[AutoCollect] Tiến hành nhặt...");
+            const result = await fetch("/index.php?ngmar=collect", {
                 method: "POST",
-                headers: {"Content-Type":"application/x-www-form-urlencoded"},
+                headers: { "Content-Type": "application/x-www-form-urlencoded" },
                 body: "sajax=collect",
                 credentials: "include"
-            });
-            let json2 = await res2.json();
-            console.log("Collect result:", json2);
+            }).then(r => r.json());
 
-            let itemName = json2.name || "Vật phẩm không tên";
+            const itemName = result.name || "Vật phẩm không tên";
+            const chapterId = app?.reader?.getPCN?.().current?.cid;
+            if (!chapterId) return console.warn("Không có chapter id.");
 
-            // 3) Chapter id
-            let current = app.reader.getPCN().current;
-            if (!current || !current.cid) {
-                console.warn("Không lấy được chapter id, bỏ qua fcl request");
-                return;
-            }
-            let chapterId = current.cid;
-
-            // 4) Delay ngẫu nhiên
-            let delay = Math.random() * 5000 + 5000;
-            console.log("Chờ", Math.round(delay/1000), "giây trước khi gửi request fcl...");
+            // delay ngẫu nhiên 5-10s
+            const delay = 5000 + Math.random() * 5000;
+            console.log(`[AutoCollect] Đợi ${(delay / 1000).toFixed(1)}s rồi fcl...`);
             await new Promise(r => setTimeout(r, delay));
 
-            // 5) FCL
-            let params3 = `ajax=fcollect&c=${chapterId}`;
-            let res3 = await fetch("/index.php?ngmar=fcl", {
+            const fcl = await fetch("/index.php?ngmar=fcl", {
                 method: "POST",
-                headers: {"Content-Type":"application/x-www-form-urlencoded"},
-                body: params3,
+                headers: { "Content-Type": "application/x-www-form-urlencoded" },
+                body: `ajax=fcollect&c=${chapterId}`,
                 credentials: "include"
-            });
-            let json3 = await res3.json();
-            console.log("FCL result:", json3);
+            }).then(r => r.json());
 
-            if (json3.code == 1) {
-                console.log("Nhặt thành công!");
-                let now = new Date();
-                let timeStr = now.toLocaleTimeString();
-                // Lưu timestamp
-                setCookie("lastCollectTime", now.getTime());
+            if (fcl.code === 1) {
+                const now = new Date();
+                Cookie.set("lastCollectTime", now.getTime());
+                Cookie.set("lastCollectItem", itemName);
 
-                let displayDiv = document.getElementById("login-check-div");
-                if (displayDiv) {
-                    displayDiv.innerText = `${itemName} - Thời gian nhặt cuối: ${timeStr}`;
-                    if (app.reader.nextChapter) app.reader.nextChapter();
-                }
+                console.log(`[AutoCollect] Nhặt ${itemName} thành công lúc ${now.toLocaleTimeString()}`);
+
+                const el = document.getElementById("login-check-div");
+                if (el) el.innerText = `${itemName} - ${now.toLocaleTimeString()}`;
+
+                app?.reader?.nextChapter?.();
             } else {
-                console.warn("Lỗi khi nhặt:", json3.err || json3);
+                console.warn("[AutoCollect] FCL lỗi:", fcl.err || fcl);
             }
 
-        } catch (e) {
-            console.error("Lỗi app.net.collect:", e);
+        } catch (err) {
+            console.error("[AutoCollect] Lỗi:", err);
         }
-    });
-
-    // ===== Lập lịch động với setTimeout, có kiểm tra display mỗi lần =====
-    function scheduleCollect() {
-        if (AutoCollectState.stopped) return;
-
-        // Nếu display null ngay trước khi chạy, dừng
-        if (!app.reader || app.reader.display == null) {
-            stopAutoCollect("display null trước lần chạy kế tiếp");
-            return;
-        }
-
-        try { app.net.collect(); } catch(e){ console.error("Lỗi trong collect:", e); }
-
-        const interval = getNextInterval();
-        AutoCollectState.lastInterval = interval;
-        console.log("Lên lịch nhặt sau", interval/1000, "giây");
-        AutoCollectState.runningTimeoutId = setTimeout(scheduleCollect, interval);
     }
 
-    // ===== Khởi động =====
-    console.log("Bắt đầu auto collect...");
-    startDisplayWatcher();    // theo dõi display liên tục
-    app.net.collect();        // chạy ngay lần đầu
-    scheduleCollect();        // lập lịch động
+    // ===== Lên lịch lần kế tiếp =====
+    function scheduleNext() {
+        if (state.stopped) return;
+        if (!app?.reader?.display) return stop("display null trước khi lên lịch");
 
+        collect().finally(() => {
+            const interval = getIntervalByLevel();
+            console.log(`[AutoCollect] Lên lịch chạy lại sau ${(interval / 60000).toFixed(1)} phút (level ${getUserLevel()})`);
+            state.timeoutId = setTimeout(scheduleNext, interval);
+        });
+    }
+
+    // ===== Khởi động ban đầu =====
+    function init() {
+        if (!window.app?.reader || typeof app.reader.getPCN !== "function") {
+            console.log("[AutoCollect] App chưa sẵn sàng, thử lại sau 1s...");
+            return setTimeout(init, 1000);
+        }
+        if (!document.cookie.includes("access=")) {
+            console.log("[AutoCollect] Chưa đăng nhập, thử lại sau 1s...");
+            return setTimeout(init, 1000);
+        }
+
+        console.log("[AutoCollect] Bắt đầu hoạt động...");
+        startDisplayWatcher();
+        scheduleNext();
+    }
+
+    init();
 })();
