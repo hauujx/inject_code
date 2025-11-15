@@ -353,7 +353,8 @@ window.autoCollector = {
             },
             chapters: null,   // lưu danh sách chapter
             currentChapid : null,
-            book: null           // lưu luôn thông tin sách
+            book: null ,
+            detectchess: null          // lưu luôn thông tin sách
         ,
 
     botEnabled: false, // mặc định bật
@@ -462,83 +463,103 @@ window.autoCollector = {
 
    
     async collect() {
-        if (this.state.stopped || !this.botEnabled) return;
-        if (this.state.lastRead) {
+    if (this.state.stopped || !this.botEnabled) return;
+
+    // ===== Load key nếu lastRead =====
+    if (this.state.lastRead) {
         await app.reader.loadKeyFromServer(this.book.host, this.book.bookId);
         try {
-            const chapter = await app.reader.getContent2(this.book.host, this.book.bookId, this.currentChapid);
-            
+            await app.reader.getContent2(this.book.host, this.book.bookId, this.currentChapid);
         } catch (error) {
             console.error("Lỗi khi lấy nội dung chương:", error);
-            // Đảo trạng thái bot khi có lỗi
-            window.autoCollector.botEnabled = !window.autoCollector.botEnabled;
+            stopBot()
+            return;
         }
+    }
+
+    try {
+        // 1️⃣ Check nhặt
+        const res1 = await fetch("/index.php?ngmar=iscollectable", {
+            method: "POST",
+            headers: {"Content-Type":"application/x-www-form-urlencoded"},
+            body: "ngmar=tcollect&sajax=trycollect",
+            credentials: "include"
+        });
+        const check = await res1.json();
+        if (check.code !== 1) {
+            console.log("[AutoCollect] Không có item để nhặt.");
+            this.state.lastRead = false;
+            return;
+        }
+        this.detectchess = this.currentChapid;
+        // 2️⃣ Collect item
+        const res2 = await fetch("/index.php?ngmar=collect", {
+            method: "POST",
+            headers: {"Content-Type":"application/x-www-form-urlencoded"},
+            body: "sajax=collect",
+            credentials: "include"
+        });
+        const result = await res2.json();
+        console.log("[AutoCollect] Collect result:", result);
+
+        const cType = result.type;
+        const itemName = result.name || "Vật phẩm không tên";
 
         
+
+        // 4️⃣ Request FCL với retry nếu lỗi
+        let params3 = `ajax=fcollect&c=${this.detectchess}`;
+        if (cType === 3 || cType === 4) {
+            const nname = document.getElementById("cName")?.innerText || result.name;
+            const ninfo = document.getElementById("cInfo")?.innerText || result.info;
+            params3 += `&newname=${encodeURIComponent(nname)}&newinfo=${encodeURIComponent(ninfo)}`;
         }
-        try {
-            // 1️⃣ Check nhặt
-            const res1 = await fetch("/index.php?ngmar=iscollectable", {
-                method: "POST",
-                headers: {"Content-Type":"application/x-www-form-urlencoded"},
-                body: "ngmar=tcollect&sajax=trycollect",
-                credentials: "include"
-            });
-            const check = await res1.json();
-            if (check.code !== 1) {
-                console.log("[AutoCollect] Không có item để nhặt.");
-                this.state.lastRead =false;
-                return;
-            }
 
-            // 2️⃣ Collect item
-            const res2 = await fetch("/index.php?ngmar=collect", {
-                method: "POST",
-                headers: {"Content-Type":"application/x-www-form-urlencoded"},
-                body: "sajax=collect",
-                credentials: "include"
-            });
-            const result = await res2.json();
-            console.log("[AutoCollect] Collect result:", result);
-
-            const cType = result.type;
-            const itemName = result.name || "Vật phẩm không tên";    
-
-            // 4️⃣ Delay ngẫu nhiên 5–10s
-            const delay = 5000 + Math.random() * 5000;
-            console.log(`[AutoCollect] Đợi ${(delay/1000).toFixed(1)}s trước khi gửi request fcl...`);
-            await new Promise(r => setTimeout(r, delay));
-
-            // 5️⃣ Request FCL
-            let params3 = `ajax=fcollect&c=${ this.currentChapid}`;
-            console.log(params3);
-            if (cType === 3 || cType === 4) {
-                const nname = document.getElementById("cName")?.innerText || result.name;
-                const ninfo = document.getElementById("cInfo")?.innerText || result.info;
-                params3 += `&newname=${encodeURIComponent(nname)}&newinfo=${encodeURIComponent(ninfo)}`;
-            }
+        // Hàm gửi fcollect
+        const sendFCL = async () => {
             const res3 = await fetch("/index.php?ngmar=fcl", {
                 method: "POST",
                 headers: {"Content-Type":"application/x-www-form-urlencoded"},
                 body: params3,
                 credentials: "include"
             });
-            const fcl = await res3.json();
+            return await res3.json();
+        }
 
-            if (fcl.code === 1) {
-                this.saveCollectedItem(itemName,this.book,this.currentChapid);
-                console.log(`[AutoCollect] Nhặt ${itemName} thành công lúc ${new Date().toLocaleString()}`);
-                showNotification('bot lụm được'+ itemName );
-                updateNextChapter();
-                this.lastRead = true;
-            } else {
-                console.warn("[AutoCollect] FCL lỗi:", fcl.err || fcl);
+        // Gửi lần 1
+        let fcl = await sendFCL();
+
+        if (fcl.code !== 1) {
+            console.warn("[AutoCollect] FCL lỗi:", fcl.err || fcl);
+            console.log("[AutoCollect] Thử reload key + getContent2 và gửi lại FCL...");
+
+            // Lấy key mới
+            await app.reader.loadKeyFromServer(this.book.host, this.book.bookId);
+            try {
+                await app.reader.getContent2(this.book.host, this.book.bookId, this.currentChapid);
+            } catch(e) {
+                console.error("[AutoCollect] Lỗi load lại chapter:", e);
             }
 
-        } catch (err) {
-            console.error("[AutoCollect] Lỗi collect:", err);
+            // Gửi lại FCL 1 lần nữa
+            fcl = await sendFCL();
         }
-    },
+
+        if (fcl.code === 1) {
+            this.saveCollectedItem(itemName, this.book, this.currentChapid);
+            console.log(`[AutoCollect] Nhặt ${itemName} thành công lúc ${new Date().toLocaleString()}`);
+            showNotification('bot lụm được '+ itemName);
+            updateNextChapter();
+            this.state.lastRead = true;
+        } else {
+            console.error("[AutoCollect] FCL FAILED SAU KHI RETRY:", fcl.err || fcl);
+        }
+
+    } catch (err) {
+        console.error("[AutoCollect] Lỗi collect:", err);
+    }
+}
+,
 
     // ===== Lên lịch lần kế tiếp =====
     async scheduleNext() {
@@ -806,7 +827,110 @@ function updateNextChapter() {
     window.autoCollector.currentChapid = nextChapter.cid;
     console.log("[AutoCollect] Chapter tiếp theo được đặt:", window.autoCollector.currentChapid);
 }
+//=============== các hàm cần override ở đây giúp bot hoạt động ổn hơn không có tính chất gây hại ok ;) ========== //
+// ===== OVERRIDE getContent2 =====  \\
+app.reader.getContent2 = async function(h, i, c, rl) {
+    if (window.Capacitor && window.Capacitor.Plugins.Http) {
 
+        var context = window.Capacitor.Plugins.Http;
+        var headers = {
+            Cookie: document.cookie.toString() + "; mac_tt=true;",
+            "User-Agent": navigator.userAgent,
+            "x-stv-transport": "app",
+            "x-requested-with": "com.sangtacviet.mobilereader",
+        };
+
+        var url = fullUrl(
+            app.net.networkManager.bestDomain() +
+            `/?sajax=readchapter&h=${h}&bookid=${i}&c=${c}&key=${this.chapterkey}`
+        );
+
+        if (rl) {
+            url += "&rescan=true";
+        }
+
+        console.log(url);
+       const currentBook = {
+                        host: h,
+                        bookId: i,
+                        chapterId: c
+                    };
+
+        // Kiểm tra nếu autoCollector.book khác sách hiện tại
+        const bookChanged =
+            window.autoCollector.book.host !== currentBook.host ||
+            window.autoCollector.book.bookId !== currentBook.bookId;
+
+        if (bookChanged) {
+            console.log("[AutoCollect] Phát hiện sách/chapter thay đổi → tải lại danh sách chương...");
+
+            let ok = false;
+            while (!ok) {
+                ok = await fetchLastBookChapters();
+                if (!ok) {
+                    console.log("[AutoCollect] Fetch chapters lỗi, thử lại sau 1s...");
+                    await new Promise(r => setTimeout(r, 1000));
+                }
+            }
+
+            // Sau khi fetch thành công thì cập nhật book
+            window.autoCollector.book = {
+                host: h,
+                bookId: i,
+                chapterId: c
+            };
+        }
+
+        // Lưu chap hiện tại
+            window.autoCollector.currentChapid = c;
+                console.log('[AutoCollect] phát hiện thay đổi chương cid = ' + window.autoCollector.currentChapid );
+                console.log('[AutoCollect] phát hiện thay đổi chương book = ' + window.autoCollector.book );
+                var retry = 0;
+
+        while (retry < 2) {
+            try {
+                var r = await context.get({
+                    url: url,
+                    headers: headers,
+                    ipv6: false,
+                });
+
+                var j = r.data.replace(/^\uFEFF/, '');
+
+                if (j[0] != '{') {
+                    j = j.substring(j.indexOf('{'));
+                }
+
+                try {
+                    var json = JSON.parse(j);
+                    return json;
+
+                } catch (ej) {
+                    //app.debug.report(ej + ":JSON:" + encodeURIComponent(j));
+                }
+
+            } catch (e) {
+                await app.net.networkManager.checkDomains();
+                retry++;
+
+                e.message += " (retry: " + retry + ", url: " + url + ")";
+
+                url = fullUrl(
+                    app.net.networkManager.bestDomain() +
+                    `/?sajax=readchapter&h=${h}&bookid=${i}&c=${c}&key=${this.chapterkey}`
+                );
+
+                if (rl) {
+                    url += "&rescan=true";
+                }
+
+                console.log("Retrying to get content: " + url);
+                app.debug.report(e);
+            }
+        }
+        return null;
+    }
+};
 
 
 // ===== Khởi động bot =====
